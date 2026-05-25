@@ -33,7 +33,7 @@ async def async_setup_entry(
         [
             EnkiLight(coordinator, device, "state")
             for device in coordinator.data
-            if device.get("type") == "lights"
+            if device.get("type") == "lights" or device.get("deviceType") == "ceiling_fans"
         ]
     )
 
@@ -54,6 +54,8 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
         """Initialise entity."""
         super().__init__(coordinator, device, parameter)
         self._device = device
+        self._capabilities = self._get_capabilities(device)
+        self._color_temp_values = None
         if "possibleValues" in device and "change_brightness" in device["possibleValues"]:
             min = device["possibleValues"]["change_brightness"]["range"]["min"]
             max = device["possibleValues"]["change_brightness"]["range"]["max"]
@@ -61,7 +63,7 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
             LOGGER.debug("brightness max : " + str(max))
             self.BRIGHTNESS_SCALE = (min, max)
 
-        if "change_color_temperature" in device["capabilities"]:
+        if "change_color_temperature" in self._capabilities:
             self._attr_supported_color_modes.add(ColorMode.COLOR_TEMP)
             self._attr_color_mode = ColorMode.COLOR_TEMP
             if "possibleValues" in device and "change_color_temperature" in device["possibleValues"]:
@@ -74,26 +76,41 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
                 for val in values:
                     self._color_temp_values.append(int(val[1:-1]))
             else:
-                self._attr_min_color_temp_kelvin=DEFAULT_MIN_KELVIN
-                self._attr_max_color_temp_kelvin=DEFAULT_MAX_KELVIN
+                if device.get("deviceType") == "ceiling_fans":
+                    self._attr_min_color_temp_kelvin=2748
+                    self._attr_max_color_temp_kelvin=6500
+                else:
+                    self._attr_min_color_temp_kelvin=DEFAULT_MIN_KELVIN
+                    self._attr_max_color_temp_kelvin=DEFAULT_MAX_KELVIN
 
-        if "change_hue" in device["capabilities"] and "change_saturation" in device["capabilities"]:
+        if "change_hue" in self._capabilities and "change_saturation" in self._capabilities:
             self._attr_supported_color_modes.add(ColorMode.HS)
             self._attr_color_mode = ColorMode.HS
 
-        if "change_brightness" in device["capabilities"]:
+        if "change_brightness" in self._capabilities:
             if len(self._attr_supported_color_modes) == 0:
                 self._attr_supported_color_modes.add(ColorMode.BRIGHTNESS)
             if self._attr_color_mode is None:
                 self._attr_color_mode = ColorMode.BRIGHTNESS
 
-        if "switch_electrical_power" in  device["capabilities"]:
+        if "switch_electrical_power" in  self._capabilities:
             if len(self._attr_supported_color_modes) == 0:
                 self._attr_supported_color_modes.add(ColorMode.ONOFF)
                 self._attr_color_mode = ColorMode.ONOFF
 
         if len(self._attr_supported_color_modes) > 1:
             self._attr_color_mode = None  # will be resolved dynamically
+
+    def _get_capabilities(self, device):
+        if device.get("capabilities"):
+            return device["capabilities"]
+        if device.get("deviceType") == "ceiling_fans":
+            return [
+                "switch_electrical_power",
+                "change_brightness",
+                "change_color_temperature",
+            ]
+        return []
 
     @property
     def color_mode(self) -> ColorMode | None:
@@ -114,6 +131,8 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
         return last_reported_values.get("power") == "ON"
 
     def closest_temp_value(self, target_value):
+        if self._color_temp_values is None:
+            return max(self._attr_min_color_temp_kelvin, min(self._attr_max_color_temp_kelvin, target_value))
         return min(self._color_temp_values, key=lambda x: abs(x - target_value)) 
 
     async def async_turn_on(self, **kwargs: Any) -> None:

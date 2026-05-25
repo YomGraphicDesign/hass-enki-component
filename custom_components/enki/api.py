@@ -19,7 +19,8 @@ from .const import (
     ENKI_PRESENCE_API_KEY,
     ENKI_BATTERY_API_KEY,
     ENKI_LUMINOSITY_API_KEY,
-    ENKI_POWER_API_KEY)
+    ENKI_POWER_API_KEY,
+    ENKI_AIRFLOW_API_KEY)
 
 proxy = None
 ENKI_USER_AGENT = "Enki/389 CFNetwork/3860.500.112 Darwin/25.4.0"
@@ -78,7 +79,7 @@ class API:
 
                     response = await resp.json()
                     if resp.status == 200:
-                        LOGGER.debug("connect : " + str(response))
+                        LOGGER.debug("connect succeeded, token expires in %s seconds", response["expires_in"])
                         self._access_token = response["access_token"]
                         self._refresh_token = response["refresh_token"]
                         self._token_type = response["token_type"]
@@ -142,7 +143,9 @@ class API:
                             "nodeId": item["metadata"]["nodeId"],
                             "deviceName": item["title"]["label"],
                             "state": item["state"],
-                            "isEnabled": item["isEnabled"]
+                            "isEnabled": item["isEnabled"],
+                            "metadata": item["metadata"],
+                            "deviceType": item["metadata"].get("deviceType")
                         }
                         devices.append(device)
 
@@ -175,6 +178,11 @@ class API:
         elif device["type"] == "outlets" and device["isEnabled"]:
             power_details = await self.get_power_details(device.get("homeId"), device.get("nodeId"))
             self.merge_properties(device, power_details)
+        elif device.get("deviceType") == "ceiling_fans" and device["isEnabled"]:
+            light_details = await self.get_light_details(device.get("homeId"), device.get("nodeId"))
+            fan_details = await self.get_fan_details(device.get("homeId"), device.get("nodeId"))
+            self.merge_properties(device, light_details)
+            self.merge_properties(device, fan_details)
         return device
 
     async def get_node(self, home_id, node_id):
@@ -210,9 +218,12 @@ class API:
                 if resp.status == 200:
                     LOGGER.debug("get_device : " + str(response))
                     return response
+                elif resp.status == 404:
+                    LOGGER.warning("get_device skipped for device %s: status %s, response %s", id, resp.status, str(response))
+                    return {}
                 else:
                     LOGGER.error("Error on get_device. status %s, response %s", resp.status, str(response))
-                    raise ValueError("bad credentials")
+                    raise ValueError("get_device failed")
 
     async def get_light_details(self, home_id, node_id):
         """Get light state"""
@@ -308,12 +319,13 @@ class API:
         LOGGER.debug("get_sensor_details %s: %s", node_id, result)
         return result
 
-    async def get_power_details(self, home_id, node_id):
+    async def get_power_details(self, home_id, node_id, endpoint=None):
         """Get power outlet state."""
         await self.check_connected()
+        endpoint_query = f"?endpoints={endpoint}" if endpoint is not None else ""
         async with _session() as session, session.request(
             method="GET",
-            url=f"{ENKI_URL}/api-enki-power-prod/v1/power/{node_id}/check-electrical-power",
+            url=f"{ENKI_URL}/api-enki-power-prod/v1/power/{node_id}/check-electrical-power{endpoint_query}",
             headers={"Authorization": f"{self._token_type} {self._access_token}",
                      "homeId": home_id,
                      "X-Gateway-APIKey": ENKI_POWER_API_KEY},
@@ -326,12 +338,13 @@ class API:
                     LOGGER.warning("get_power_details skipped for node %s: status %s", node_id, resp.status)
                     return {}
 
-    async def change_power_state(self, home_id, node_id, power_on: bool):
+    async def change_power_state(self, home_id, node_id, power_on: bool, endpoint=None):
         """Turn power outlet on or off."""
         await self.check_connected()
+        endpoint_query = f"?endpoints={endpoint}" if endpoint is not None else ""
         async with _session() as session, session.request(
             method="POST",
-            url=f"{ENKI_URL}/api-enki-power-prod/v1/power/{node_id}/switch-electrical-power",
+            url=f"{ENKI_URL}/api-enki-power-prod/v1/power/{node_id}/switch-electrical-power{endpoint_query}",
             headers={"Authorization": f"{self._token_type} {self._access_token}",
                      "homeId": home_id,
                      "X-Gateway-APIKey": ENKI_POWER_API_KEY},
@@ -341,6 +354,46 @@ class API:
                     response = await resp.json()
                     LOGGER.error("Error on change_power_state. status %s, response %s", resp.status, str(response))
                     raise ValueError("change_power_state failed")
+
+    async def get_fan_details(self, home_id, node_id):
+        power_details = await self.get_power_details(home_id, node_id, endpoint=2)
+        speed_details = await self.get_fan_speed_details(home_id, node_id)
+        return {
+            "fanPowerValue": power_details.get("lastReportedValue"),
+            "fanSpeedValue": speed_details.get("lastReportedValue"),
+        }
+
+    async def get_fan_speed_details(self, home_id, node_id):
+        await self.check_connected()
+        async with _session() as session, session.request(
+            method="GET",
+            url=f"{ENKI_URL}/api-enki-airflow-prod/v1/airflow/{node_id}/check-fan-speed",
+            headers={"Authorization": f"{self._token_type} {self._access_token}",
+                     "homeId": home_id,
+                     "X-Gateway-APIKey": ENKI_AIRFLOW_API_KEY},
+            proxy=proxy,) as resp:
+                if resp.status == 200:
+                    response = await resp.json()
+                    LOGGER.debug("get_fan_speed_details : %s", response)
+                    return response
+                LOGGER.warning("get_fan_speed_details skipped for node %s: status %s", node_id, resp.status)
+                return {}
+
+    async def change_fan_speed(self, home_id, node_id, value: int):
+        await self.check_connected()
+        async with _session() as session, session.request(
+            method="POST",
+            url=f"{ENKI_URL}/api-enki-airflow-prod/v1/airflow/{node_id}/change-fan-speed",
+            headers={"Authorization": f"{self._token_type} {self._access_token}",
+                     "homeId": home_id,
+                     "X-Gateway-APIKey": ENKI_AIRFLOW_API_KEY},
+            proxy=proxy,
+            json={"value": value}) as resp:
+                if resp.status in (200, 202):
+                    return
+                response = await resp.json()
+                LOGGER.error("Error on change_fan_speed. status %s, response %s", resp.status, str(response))
+                raise ValueError("change_fan_speed failed")
 
 # *******************************************************
 
@@ -355,14 +408,12 @@ class API:
         cache = {d["nodeId"]: d for d in self._devices_cache} if not is_first_load else {}
         for device in devices:
             node_id = device["nodeId"]
-            if device["type"] == "lights":
+            if device.get("type") == "lights":
                 if is_first_load:
                     await self.refresh_device(device, full=True)
                 elif node_id in cache and "lastReportedValue" in cache[node_id]:
-                    # Preserve light state set by turn_on/turn_off to avoid race condition
                     device["lastReportedValue"] = cache[node_id]["lastReportedValue"]
-            else:
-                # Always refresh sensors and outlets to get up-to-date values
+            elif device.get("type") in ("sensors", "outlets") or device.get("deviceType") == "ceiling_fans":
                 await self.refresh_device(device, full=True)
 
         self._devices_cache = devices
